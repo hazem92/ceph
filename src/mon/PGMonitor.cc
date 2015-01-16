@@ -1345,6 +1345,8 @@ void PGMonitor::dump_pool_stats(stringstream &ss, Formatter *f, bool verbose)
     uint64_t avail;
     if (avail_by_rule.count(ruleno) == 0) {
       avail = get_rule_avail(osdmap, ruleno);
+      if (avail == (uint64_t)-1L)
+        avail = 0;
       avail_by_rule[ruleno] = avail;
     } else {
       avail = avail_by_rule[ruleno];
