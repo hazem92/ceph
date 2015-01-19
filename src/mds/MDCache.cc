@@ -1549,25 +1549,35 @@ void MDCache::journal_cow_dentry(MutationImpl *mut, EMetaBlob *metablob,
     dnl = dn->get_projected_linkage();
   assert(!dnl->is_null());
 
-  if (dnl->is_primary() && dnl->get_inode()->is_multiversion()) {
+  if (dnl->is_primary()) {
     // multiversion inode.
     CInode *in = dnl->get_inode();
 
-    if (follows == CEPH_NOSNAP)
+    if (in->get_projected_parent_dn() != dn) {
+      assert(follows == CEPH_NOSNAP);
+      snapid_t dir_follows = dn->dir->inode->find_snaprealm()->get_newest_seq();
+
+      if (dir_follows+1 > dn->first) {
+	snapid_t oldfirst = dn->first;
+	dn->first = dir_follows+1;
+	CDentry *olddn = dn->dir->add_remote_dentry(dn->name, in->ino(),  in->d_type(),
+						    oldfirst, dir_follows);
+	olddn->pre_dirty();
+	dout(10) << " olddn " << *olddn << dendl;
+	metablob->add_remote_dentry(olddn, true);
+	mut->add_cow_dentry(olddn);
+	// FIXME: adjust link count here?  hmm.
+
+	if (dir_follows+1 > in->first)
+	  in->cow_old_inode(dir_follows, false);
+      }
+
+      if (in->snaprealm)
+	follows = in->snaprealm->get_newest_seq();
+      else
+	follows = dir_follows;
+    } else if (follows == CEPH_NOSNAP) {
       follows = in->find_snaprealm()->get_newest_seq();
-
-    if (in->get_projected_parent_dn() != dn &&
-	follows+1 > dn->first) {
-      snapid_t oldfirst = dn->first;
-      dn->first = follows+1;
-      CDentry *olddn = dn->dir->add_remote_dentry(dn->name, in->ino(),  in->d_type(),
-						  oldfirst, follows);
-      olddn->pre_dirty();
-      dout(10) << " olddn " << *olddn << dendl;
-      metablob->add_remote_dentry(olddn, true);
-      mut->add_cow_dentry(olddn);
-
-      // FIXME: adjust link count here?  hmm.
     }
 
     // already cloned?
@@ -7510,6 +7520,12 @@ int MDCache::path_traverse(MDRequestRef& mdr, Message *req, MDSInternalContextBa
       if (dn->lock.can_read(client) ||
 	  (dn->lock.is_xlocked() && dn->lock.get_xlock_by() == mdr)) {
         dout(10) << "traverse: miss on null+readable dentry " << path[depth] << " " << *dn << dendl;
+	if (pdnvec) {
+	  if (depth == path.depth() - 1)
+	    pdnvec->push_back(dn);
+	  else
+	    pdnvec->clear();   // do not confuse likes of rdlock_path_pin_ref();
+	}
         return -ENOENT;
       } else {
         dout(10) << "miss on dentry " << *dn << ", can't read due to lock" << dendl;
@@ -8911,19 +8927,25 @@ void MDCache::eval_stray(CDentry *dn, bool delay)
 
   // purge?
   if (in->inode.nlink == 0) {
-    if (in->is_dir()) {
       // past snaprealm parents imply snapped dentry remote links.
       // only important for directories.  normal file data snaps are handled
       // by the object store.
+    if (in->snaprealm && in->snaprealm->has_past_parents()) {
+      if (!in->snaprealm->have_past_parents_open() &&
+	  !in->snaprealm->open_parents(new C_MDC_EvalStray(this, dn)))
+	return;
+      in->snaprealm->prune_past_parents();
+    }
+    if (in->is_dir()) {
       if (in->snaprealm && in->snaprealm->has_past_parents()) {
-	if (!in->snaprealm->have_past_parents_open() &&
-	    !in->snaprealm->open_parents(new C_MDC_EvalStray(this, dn)))
-	  return;
-	in->snaprealm->prune_past_parents();
-	if (in->snaprealm->has_past_parents()) {
-	  dout(20) << "  has past parents " << in->snaprealm->srnode.past_parents << dendl;
-	  return;  // not until some snaps are deleted.
-	}
+	dout(20) << "  directory has past parents " << in->snaprealm->srnode.past_parents << dendl;
+	return;  // not until some snaps are deleted.
+      }
+      if (in->has_dirfrags()) {
+	list<CDir*> ls;
+	in->get_nested_dirfrags(ls);
+	for (list<CDir*>::iterator p = ls.begin(); p != ls.end(); ++p)
+	  (*p)->try_remove_dentries_for_stray();
       }
     }
     if (dn->is_replicated()) {
@@ -8954,6 +8976,11 @@ void MDCache::eval_stray(CDentry *dn, bool delay)
     if (delay) {
       if (!dn->item_stray.is_on_list())
 	delayed_eval_stray.push_back(&dn->item_stray);
+    } else if (in->snaprealm && in->snaprealm->has_past_parents()) {
+      assert(!in->is_dir());
+      dout(20) << " file has past parents " << in->snaprealm->srnode.past_parents << dendl;
+      if (in->is_file() && in->get_projected_inode()->size > 0)
+	truncate_stray(dn); // truncate head objects
     } else {
       if (in->is_dir())
 	in->close_dirfrags();
@@ -8978,16 +9005,6 @@ void MDCache::eval_stray(CDentry *dn, bool delay)
     }
   } else {
     // wait for next use.
-  }
-}
-
-void MDCache::try_remove_dentries_for_stray(CInode* diri) {
-  assert(diri->inode.nlink == 0);
-  if (diri->has_dirfrags()) {
-    list<CDir*> ls;
-    diri->get_nested_dirfrags(ls);
-    for (list<CDir*>::iterator p = ls.begin(); p != ls.end(); ++p)
-      (*p)->try_remove_dentries_for_stray();
   }
 }
 
@@ -9016,14 +9033,67 @@ void MDCache::fetch_backtrace(inodeno_t ino, int64_t pool, bufferlist& bl, Conte
 
 class C_IO_MDC_PurgeStrayPurged : public MDCacheIOContext {
   CDentry *dn;
+  bool only_head;
 public:
-  C_IO_MDC_PurgeStrayPurged(MDCache *c, CDentry *d) : 
-    MDCacheIOContext(c), dn(d) { }
+  C_IO_MDC_PurgeStrayPurged(MDCache *c, CDentry *d, bool oh) :
+    MDCacheIOContext(c), dn(d), only_head(oh) { }
   void finish(int r) {
     assert(r == 0 || r == -ENOENT);
-    mdcache->_purge_stray_purged(dn, r);
+    mdcache->_purge_stray_purged(dn, only_head);
   }
 };
+
+void MDCache::truncate_stray(CDentry *dn)
+{
+  CDentry::linkage_t *dnl = dn->get_projected_linkage();
+  CInode *in = dnl->get_inode();
+  dout(10) << "truncate_stray " << *dn << " " << *in << dendl;
+  assert(!dn->is_replicated());
+
+  dn->state_set(CDentry::STATE_PURGING);
+  dn->get(CDentry::PIN_PURGING);
+  in->state_set(CInode::STATE_PURGING);
+
+  if (dn->item_stray.is_on_list())
+    dn->item_stray.remove_myself();
+
+  C_GatherBuilder gather(
+    g_ceph_context,
+    new C_OnFinisher(new C_IO_MDC_PurgeStrayPurged(this, dn, true),
+		     &mds->finisher));
+
+  SnapRealm *realm = in->find_snaprealm();
+  assert(realm);
+  dout(10) << " realm " << *realm << dendl;
+  const SnapContext *snapc = &realm->get_snap_context();
+
+  uint64_t period = (uint64_t)in->inode.layout.fl_object_size *
+		    (uint64_t)in->inode.layout.fl_stripe_count;
+  uint64_t to = in->inode.get_max_size();
+  to = MAX(in->inode.size, to);
+  // when truncating a file, the filer does not delete stripe objects that are
+  // truncated to zero. so we need to purge stripe objects up to the max size
+  // the file has ever been.
+  to = MAX(in->inode.max_size_ever, to);
+  if (period && to > period) {
+    uint64_t num = (to - 1) / period;
+    dout(10) << "purge_stray 0~" << to << " objects 0~" << num
+      << " snapc " << snapc << " on " << *in << dendl;
+    mds->filer->purge_range(in->ino(), &in->inode.layout, *snapc,
+			    1, num, ceph_clock_now(g_ceph_context),
+			    0, gather.new_sub());
+  }
+
+  // keep backtrace object
+  if (period && to > 0) {
+    mds->filer->zero(in->ino(), &in->inode.layout, *snapc,
+		     0, period, ceph_clock_now(g_ceph_context),
+		     0, true, NULL, gather.new_sub());
+  }
+
+  assert(gather.has_subs());
+  gather.activate();
+}
 
 void MDCache::purge_stray(CDentry *dn)
 {
@@ -9049,7 +9119,8 @@ void MDCache::purge_stray(CDentry *dn)
   SnapContext nullsnapc;
   C_GatherBuilder gather(
     g_ceph_context,
-    new C_OnFinisher(new C_IO_MDC_PurgeStrayPurged(this, dn), &mds->finisher));
+    new C_OnFinisher(new C_IO_MDC_PurgeStrayPurged(this, dn, false),
+		     &mds->finisher));
 
   if (in->is_dir()) {
     object_locator_t oloc(mds->mdsmap->get_metadata_pool());
@@ -9146,13 +9217,13 @@ public:
   }
 };
 
-void MDCache::_purge_stray_purged(CDentry *dn, int r)
+void MDCache::_purge_stray_purged(CDentry *dn, bool only_head)
 {
-  assert (r == 0 || r == -ENOENT);
   CInode *in = dn->get_projected_linkage()->get_inode();
   dout(10) << "_purge_stray_purged " << *dn << " " << *in << dendl;
 
-  if (in->get_num_ref() == (int)in->is_dirty() &&
+  if (!only_head &&
+      in->get_num_ref() == (int)in->is_dirty() &&
       dn->get_num_ref() == (int)dn->is_dirty() + !!in->get_num_ref() + 1/*PIN_PURGING*/) {
     // kill dentry.
     version_t pdv = dn->pre_dirty();
@@ -9184,6 +9255,7 @@ void MDCache::_purge_stray_purged(CDentry *dn, int r)
     
     inode_t *pi = in->project_inode();
     pi->size = 0;
+    pi->max_size_ever = 0;
     pi->client_ranges.clear();
     pi->truncate_size = 0;
     pi->truncate_from = 0;
@@ -9242,8 +9314,6 @@ void MDCache::_purge_stray_logged_truncate(CDentry *dn, LogSegment *ls)
 
   eval_stray(dn);
 }
-
-
 
 void MDCache::reintegrate_stray(CDentry *straydn, CDentry *rdn)
 {

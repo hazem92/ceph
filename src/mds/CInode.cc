@@ -278,10 +278,18 @@ void CInode::add_need_snapflush(CInode *snapin, snapid_t snapid, client_t client
 void CInode::remove_need_snapflush(CInode *snapin, snapid_t snapid, client_t client)
 {
   dout(10) << "remove_need_snapflush client." << client << " snapid " << snapid << " on " << snapin << dendl;
-  set<client_t>& clients = client_need_snapflush[snapid];
-  clients.erase(client);
-  if (clients.empty()) {
-    client_need_snapflush.erase(snapid);
+  map<snapid_t, std::set<client_t> >::iterator p = client_need_snapflush.find(snapid);
+  if (p == client_need_snapflush.end()) {
+    dout(10) << " snapid not found" << dendl;
+    return;
+  }
+  if (!p->second.count(client)) {
+    dout(10) << " client not found" << dendl;
+    return;
+  }
+  p->second.erase(client);
+  if (p->second.empty()) {
+    client_need_snapflush.erase(p);
     snapin->auth_unpin(this);
 
     if (client_need_snapflush.empty()) {
@@ -371,7 +379,7 @@ sr_t *CInode::project_snaprealm(snapid_t snapid)
   } else {
     new_srnode = new sr_t();
     new_srnode->created = snapid;
-    new_srnode->current_parent_since = snapid;
+    new_srnode->current_parent_since = get_oldest_snap();
   }
   dout(10) << "project_snaprealm " << new_srnode << dendl;
   projected_nodes.back()->snapnode = new_srnode;
@@ -1193,7 +1201,7 @@ void CInode::clear_dirty_parent()
 
 void CInode::verify_diri_backtrace(bufferlist &bl, int err)
 {
-  if (is_base() || is_dirty_parent())
+  if (is_base() || is_dirty_parent() || !is_auth())
     return;
 
   dout(10) << "verify_diri_backtrace" << dendl;
